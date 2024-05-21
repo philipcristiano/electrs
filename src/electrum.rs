@@ -209,7 +209,12 @@ impl Rpc {
         Ok(json!({"hex": serialize_hex(header), "height": height}))
     }
 
-    fn block_header(&self, (height,): (usize,)) -> Result<Value> {
+    pub fn chain_height(&self) -> Result<Value> {
+        let chain = self.tracker.chain();
+        Ok(json!(chain.height()))
+    }
+
+    pub fn block_header(&self, (height,): (usize,)) -> Result<Value> {
         let chain = self.tracker.chain();
         let header = match chain.get_block_header(height) {
             None => bail!("no header at {}", height),

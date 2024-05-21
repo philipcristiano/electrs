@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::{
@@ -11,17 +8,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use crossbeam_channel::{Receiver, Sender};
-use serde_json::Value;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    join,
-    net::TcpStream,
-    task,
-};
+use tokio::{join, task};
 use tower_http::cors::CorsLayer;
 
 use crate::config::Config;
+use crate::electrum::Rpc;
 
 // Transactions
 async fn get_tx() -> Result<impl IntoResponse, AppError> {
@@ -160,12 +151,11 @@ async fn get_blocks_by_height() -> Result<impl IntoResponse, AppError> {
 
 #[axum::debug_handler]
 async fn get_block_height(
-    State(state): State<Arc<AppState>>,
+    State(amrpc): State<Arc<Mutex<Rpc>>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let req = rpc_request(state.clone(), "blockchain.headers.subscribe", vec![]).await?;
-    let res: BlockchainHeadersSubscribe = serde_json::from_slice(&req)?;
-
-    Ok((StatusCode::OK, res.block_height.to_string()))
+    let rpc = amrpc.lock().unwrap();
+    let height = rpc.chain_height()?;
+    Ok(height.to_string())
 }
 
 async fn get_block_tip_hash() -> Result<impl IntoResponse, AppError> {
@@ -190,129 +180,9 @@ async fn get_fee_estimates() -> Result<impl IntoResponse, AppError> {
     Ok(StatusCode::OK)
 }
 
-#[allow(dead_code)]
-#[derive(Deserialize)]
-struct BlockchainHeadersSubscribe {
-    nonce: u64,
-    prev_block_hash: String,
-    timestamp: u64,
-    merkle_root: String,
-    block_height: u32,
-    utxo_root: String,
-    version: u32,
-    bits: u64,
-}
-
-#[derive(Serialize)]
-struct Request {
-    id: Value,
-    method: String,
-    params: Value,
-}
-
-#[derive(Deserialize)]
-struct RequestId {
-    id: usize,
-}
-
-async fn rpc_request(state: Arc<AppState>, method: &str, params: Vec<Value>) -> Result<Vec<u8>> {
-    let req_id = state.id.fetch_add(1, Ordering::SeqCst);
-
-    let request = Request {
-        id: Value::from(req_id),
-        method: method.to_owned(),
-        params: Value::from(params),
-    };
-
-    let req = serde_json::to_vec(&request)?;
-
-    state.req_tx.send(req)?;
-    debug!("hello C");
-
-    loop {
-        let (res_id, res) = state.res_rx.recv()?;
-
-        debug!("hello D");
-
-        if req_id == res_id {
-            return Ok(res);
-        }
-    }
-}
-
-struct AppState {
-    id: AtomicUsize,
-    req_tx: Sender<Vec<u8>>,
-    res_rx: Receiver<(usize, Vec<u8>)>,
-}
-
 /// Esplora HTTP API according to these docs:
 /// <https://github.com/Blockstream/esplora/blob/master/API.md#esplora-http-api>
-pub async fn serve(config: Arc<Config>) -> Result<()> {
-    let socket = TcpStream::connect(config.daemon_rpc_addr).await?;
-    let (mut tcp_rx, mut tcp_tx) = socket.into_split();
-    let id = AtomicUsize::new(0);
-
-    let (req_tx, req_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let (res_tx, res_rx) = crossbeam_channel::unbounded::<(usize, Vec<u8>)>();
-
-    let state = Arc::new(AppState { id, req_tx, res_rx });
-    let headers_sub_state = state.clone();
-
-    // TCP writer
-    let tcp_writer = task::spawn(async move {
-        debug!("writer 1");
-        loop {
-            let req = req_rx.recv().unwrap();
-            debug!("HTTP Request: {}", String::from_utf8_lossy(&req));
-            tcp_tx.write_all(&req).await.unwrap();
-            debug!("writer 3");
-        }
-    });
-
-    // TCP reader
-    let tcp_reader = task::spawn(async move {
-        let mut buf = [0; 1500];
-        let mut brackets = 0;
-        let mut msg: Vec<u8> = vec![];
-
-        debug!("reader 1");
-        while let Ok(_bytes) = tcp_rx.read(&mut buf).await {
-            debug!("reader 2");
-            for byte in buf {
-                if byte == b'{' {
-                    debug!("reader {{");
-                    brackets += 1;
-                } else if byte == b'}' {
-                    debug!("reader }}");
-                    if brackets == 1 {
-                        match serde_json::from_slice(&msg) {
-                            Ok(res) => {
-                                let RequestId { id } = res;
-                                res_tx.send((id, msg)).unwrap();
-                                msg = vec![];
-                            }
-                            Err(e) => {
-                                error!("Error parsing message: {e}");
-                                debug!("Message was: {}", String::from_utf8_lossy(&msg));
-                            }
-                        }
-                    }
-                    brackets -= 1;
-                }
-                msg.push(byte);
-            }
-        }
-
-        debug!("reader msg: {}", String::from_utf8_lossy(&msg));
-    });
-
-    let subscriber = task::spawn(async move {
-        rpc_request(headers_sub_state, "blockchain.headers.subscribe", vec![])
-            .await
-            .unwrap();
-    });
-
+pub async fn serve(config: Arc<Config>, am_client: Arc<Mutex<Rpc>>) -> Result<()> {
     let server = task::spawn(async move {
         let app = Router::new()
             // Transactions
@@ -377,7 +247,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             .route("/mempool/recent", get(get_mempool_recent))
             // Fee estimates
             .route("/fee-estimates", get(get_fee_estimates))
-            .with_state(state)
+            .with_state(am_client)
             .layer(CorsLayer::permissive());
 
         info!("serving Esplora REST on {}", config.http_addr);
@@ -388,7 +258,8 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             .unwrap();
     });
 
-    let _ = join!(tcp_writer, tcp_reader, subscriber, server);
+    //let _ = join!(tcp_writer, tcp_reader, subscriber, server);
+    let _ = join!(server);
 
     Ok(())
 }

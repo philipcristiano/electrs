@@ -9,7 +9,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     iter::once,
     net::{Shutdown, TcpListener, TcpStream},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -75,32 +75,6 @@ fn serve() -> Result<()> {
         let listener = TcpListener::bind(config.electrum_rpc_addr)?;
         info!("serving Electrum RPC on {}", listener.local_addr()?);
         spawn("accept_loop", || accept_loop(listener, server_tx)); // detach accepting thread
-
-        #[cfg(feature = "http")]
-        let config = config.clone();
-        #[cfg(feature = "http")]
-        {
-            use crossbeam_channel::bounded;
-
-            let (http_status_tx, http_status_rx) = bounded::<Option<String>>(1);
-
-            let rt = Runtime::new()?;
-            rt.spawn(async move {
-                match rest::serve(config.clone()).await {
-                    Ok(_) => {
-                        http_status_tx.send(None).unwrap();
-                    }
-                    Err(e) => {
-                        error!("error in http server: {}", e);
-                        http_status_tx.send(Some(e.to_string())).unwrap();
-                    }
-                }
-            });
-
-            if let Some(err) = http_status_rx.recv().unwrap() {
-                return Err(anyhow!(err));
-            }
-        }
     };
 
     let server_batch_size = metrics.histogram_vec(
@@ -118,13 +92,28 @@ fn serve() -> Result<()> {
 
     let (signal_tx, signal_rx) = unbounded();
     let signal = Signal::new(signal_tx);
-    let mut rpc = Rpc::new(&config, metrics, signal)?;
-    let new_block_rx = rpc.new_block_notification();
+    let source_rpc = Rpc::new(&config, metrics, signal)?;
+    let arc_m_rpc = Arc::new(Mutex::new(source_rpc));
+
+    #[cfg(feature = "http")]
+    let http_config = config.clone();
+    #[cfg(feature = "http")]
+    let http_rpc = arc_m_rpc.clone();
+    #[cfg(feature = "http")]
+    let rt = Runtime::new()?;
+    #[cfg(feature = "http")]
+    rt.spawn(async move { rest::serve(http_config.clone(), http_rpc).await });
+
+    let new_block_rx = {
+        let rpc = arc_m_rpc.lock().unwrap();
+        rpc.new_block_notification()
+    };
     let mut peers = HashMap::<usize, Peer>::new();
 
     loop {
         // initial sync and compaction may take a few hours
         while server_rx.is_empty() {
+            let mut rpc = arc_m_rpc.lock().unwrap();
             let done = duration.observe_duration("sync", || rpc.sync().context("sync failed"))?; // sync a batch of blocks
             peers = duration.observe_duration("notify", || notify_peers(&rpc, peers)); // peers are disconnected on error
             if !done {
@@ -140,6 +129,7 @@ fn serve() -> Result<()> {
                 // Handle signals for graceful shutdown
                 recv(signal_rx) -> result => {
                     result.context("signal channel disconnected")?;
+                    let rpc = arc_m_rpc.lock().unwrap();
                     rpc.signal().exit_flag().poll().context("RPC server interrupted")?;
                 },
                 // Handle new blocks' notifications
@@ -156,6 +146,8 @@ fn serve() -> Result<()> {
                     let rest = server_rx.iter().take(server_rx.len());
                     let events: Vec<Event> = first.chain(rest).collect();
                     server_batch_size.observe("recv", events.len() as f64);
+
+                    let rpc = arc_m_rpc.lock().unwrap();
                     duration.observe_duration("handle", || handle_events(&rpc, &mut peers, events));
                 },
                 default(config.wait_duration) => (), // sync and update
