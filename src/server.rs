@@ -16,7 +16,7 @@ use crate::{
     config::Config,
     electrum::{Client, Rpc},
     metrics::{self, Metrics},
-    signals::ExitError,
+    signals::{ExitError, Signal},
     thread::spawn,
 };
 
@@ -115,8 +115,10 @@ fn serve() -> Result<()> {
         "step",
         metrics::default_duration_buckets(),
     );
-    let mut rpc = Rpc::new(&config, metrics)?;
 
+    let (signal_tx, signal_rx) = unbounded();
+    let signal = Signal::new(signal_tx);
+    let mut rpc = Rpc::new(&config, metrics, signal)?;
     let new_block_rx = rpc.new_block_notification();
     let mut peers = HashMap::<usize, Peer>::new();
 
@@ -136,7 +138,7 @@ fn serve() -> Result<()> {
         duration.observe_duration("select", || -> Result<()> {
             select! {
                 // Handle signals for graceful shutdown
-                recv(rpc.signal().receiver()) -> result => {
+                recv(signal_rx) -> result => {
                     result.context("signal channel disconnected")?;
                     rpc.signal().exit_flag().poll().context("RPC server interrupted")?;
                 },

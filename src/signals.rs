@@ -1,5 +1,5 @@
 use anyhow::Context;
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::Sender;
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
 
@@ -48,19 +48,16 @@ impl ExitFlag {
 }
 
 pub(crate) struct Signal {
-    rx: Receiver<()>,
     exit: ExitFlag,
 }
 
 impl Signal {
-    pub fn new() -> Signal {
+    pub fn new(tx: Sender<()>) -> Signal {
         let ids = vec![
             SIGINT, SIGTERM,
             SIGUSR1, // allow external triggering (e.g. via bitcoind `blocknotify`)
         ];
-        let (tx, rx) = unbounded();
         let result = Signal {
-            rx,
             exit: ExitFlag::new(),
         };
 
@@ -78,10 +75,6 @@ impl Signal {
             Ok(())
         });
         result
-    }
-
-    pub fn receiver(&self) -> &Receiver<()> {
-        &self.rx
     }
 
     pub fn exit_flag(&self) -> &ExitFlag {
